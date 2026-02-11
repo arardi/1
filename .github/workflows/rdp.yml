@@ -1,4 +1,4 @@
-name: RDP
+name: RDP with JDK 21
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ jobs:
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          # Enable Remote Desktop and disable Network Level Authentication
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -22,39 +22,99 @@ jobs:
           # Remove any existing rule with the same name to avoid duplication
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
           
-          # For testing, allow any incoming connection on port 3389
+          # Allow incoming connection on port 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          # Restart Remote Desktop service
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User with Secure Password
+      - name: Create RDP User with Fixed Password
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $password = "Zhe#111"
+          
+          # Hapus user lama jika ada
+          Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+          
+          # Buat user baru dengan password tetap
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          New-LocalUser -Name "RDP" -Password $securePass -PasswordNeverExpires -UserMayNotChangePassword
+          
+          # Tambah ke grup
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          # Aktifkan user
+          Enable-LocalUser -Name "RDP"
           
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
+          # Simpan credentials
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          
+          Write-Host "✅ RDP User created with password: $password"
+
+      - name: Download and Install JDK 21
+        run: |
+          $jdkUrl = "https://download.oracle.com/java/21/archive/jdk-21.0.9_windows-x64_bin.exe"
+          $installerPath = "$env:TEMP\jdk-21-installer.exe"
+          $installDir = "C:\Program Files\Java\jdk-21"
+          
+          Write-Host "📥 Downloading JDK 21..."
+          # Gunakan header yang diperlukan untuk download dari Oracle
+          $headers = @{
+            "Cookie" = "oraclelicense=accept-securebackup-cookie"
+          }
+          Invoke-WebRequest -Uri $jdkUrl -Headers $headers -OutFile $installerPath
+          
+          Write-Host "⚙️ Installing JDK 21..."
+          # Install JDK secara silent
+          Start-Process -FilePath $installerPath -ArgumentList "/s", "INSTALLDIR=`"$installDir`"" -Wait -NoNewWindow
+          
+          # Tunggu instalasi selesai
+          Start-Sleep -Seconds 10
+          
+          # Set environment variables
+          Write-Host "🔧 Setting environment variables..."
+          [Environment]::SetEnvironmentVariable("JAVA_HOME", $installDir, "Machine")
+          [Environment]::SetEnvironmentVariable("JAVA_HOME", $installDir, "User")
+          
+          # Update PATH
+          $currentPath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
+          $newPath = "$installDir\bin;" + $currentPath
+          [Environment]::SetEnvironmentVariable("PATH", $newPath, "Machine")
+          [Environment]::SetEnvironmentVariable("PATH", $newPath, "User")
+          
+          # Verifikasi instalasi
+          Write-Host "✅ JDK 21 installation completed"
+          
+          # Bersihkan installer
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+
+      - name: Verify JDK Installation
+        run: |
+          Write-Host "🔍 Verifying JDK installation..."
+          
+          # Cek JAVA_HOME
+          $javaHome = [Environment]::GetEnvironmentVariable("JAVA_HOME", "Machine")
+          Write-Host "JAVA_HOME: $javaHome"
+          
+          # Cek apakah java.exe ada
+          $javaPath = "$javaHome\bin\java.exe"
+          if (Test-Path $javaPath) {
+            Write-Host "✅ Java executable found at: $javaPath"
+          } else {
+            Write-Host "❌ Java executable not found!"
+          }
+          
+          # Cek versi Java (perlu refresh environment)
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          java -version
+          
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "✅ Java version check successful"
+          } else {
+            Write-Host "❌ Java version check failed"
           }
 
       - name: Install Tailscale
@@ -85,29 +145,59 @@ jobs:
               exit 1
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "🌐 Tailscale IP: $tsIP"
       
       - name: Verify RDP Accessibility
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "🔌 Testing RDP connectivity..."
           
           # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
+              Write-Error "❌ TCP connection to RDP port 3389 failed"
               exit 1
           }
-          Write-Host "TCP connectivity successful!"
+          Write-Host "✅ TCP connectivity successful!"
+
+      - name: Display Connection Information
+        run: |
+          Write-Host ""
+          Write-Host "═══════════════════════════════════════════════════════════════"
+          Write-Host "                     🖥️  RDP ACCESS INFORMATION                 "
+          Write-Host "═══════════════════════════════════════════════════════════════"
+          Write-Host ""
+          Write-Host "📍 Remote Desktop Address: $env:TAILSCALE_IP"
+          Write-Host "👤 Username: RDP"
+          Write-Host "🔑 Password: Zhe#111"
+          Write-Host ""
+          Write-Host "📦 Installed Software:"
+          Write-Host "   • JDK 21 (Java Development Kit)"
+          Write-Host "   • Tailscale VPN"
+          Write-Host ""
+          Write-Host "🔧 Java Environment:"
+          Write-Host "   • JAVA_HOME: C:\Program Files\Java\jdk-21"
+          Write-Host "   • Path: C:\Program Files\Java\jdk-21\bin"
+          Write-Host ""
+          Write-Host "⚠️  Note: This RDP session will timeout after 60 minutes"
+          Write-Host "═══════════════════════════════════════════════════════════════"
+          Write-Host ""
 
       - name: Maintain Connection
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
+          # Keep runner active
+          $timeoutMinutes = 60
+          $startTime = Get-Date
           
-          # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+              $elapsed = (Get-Date) - $startTime
+              $remaining = $timeoutMinutes - [math]::Round($elapsed.TotalMinutes)
+              
+              if ($remaining -le 0) {
+                  Write-Host "⏰ Timeout reached (60 minutes). Stopping RDP session..."
+                  break
+              }
+              
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP Active - Time remaining: $remaining minutes"
+              Write-Host "  Address: $env:TAILSCALE_IP | User: RDP | Pass: Zhe#111"
+              Start-Sleep -Seconds 60
           }
